@@ -3,17 +3,31 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 from datetime import datetime
-from dotenv import load_dotenv  # ← ADD THIS
-import google.generativeai as genai  # ← ADD THIS
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 CORS(app)
 
-# Load environment variables
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+# Load environment variables (DT1/.env takes precedence)
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'), override=True)
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-3.8-flash')
+
+# Resilient Gemini Client initialization
+gemini_client = None
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if gemini_api_key:
+    try:
+        gemini_client = genai.Client(
+            api_key=gemini_api_key.strip(),
+            http_options=types.HttpOptions(timeout=15000)
+        )
+    except Exception as e:
+        print(f"[Gemini Client Init Warning] Could not initialize client: {e}", flush=True)
+        gemini_client = None
+else:
+    print("[Gemini Client Notice] GEMINI_API_KEY is not set. Chatbot will use fallback responses.", flush=True)
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'database.xlsx')
 
@@ -21,7 +35,7 @@ def init_db():
     if not os.path.exists(DB_FILE):
         with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
             pd.DataFrame(columns=['id', 'name', 'email', 'password', 'age', 'goal', 'notifications', 'xp', 'level', 'created_at']).to_excel(writer, sheet_name='users', index=False)
-            pd.DataFrame(columns=['timestamp', 'email', 'travel', 'shopping', 'electricity', 'waste', 'total_footprint']).to_excel(writer, sheet_name='footprints', index=False)
+            pd.DataFrame(columns=['timestamp', 'email', 'travel', 'shopping', 'electricity', 'waste', 'food', 'cooking_gas', 'total_footprint']).to_excel(writer, sheet_name='footprints', index=False)
 
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -110,18 +124,23 @@ def chat():
             "to adopt eco-friendly habits. Keep responses concise (2-4 sentences) and encouraging."
         )
         
-        full_prompt = f"{system_prompt}\n\nUser: {user_message}\nEcoBot:"
-        
-        # Call Gemini 3.5 Flash with a fast timeout (3.5s)
+        # Call Gemini gemini-3.5-flash-lite with 15s timeout (set at client level)
         bot_response = None
-        try:
-            g_model = genai.GenerativeModel('gemini-3.5-flash')
-            resp = g_model.generate_content(full_prompt, request_options={"timeout": 3.5})
-            if resp and resp.text:
-                bot_response = resp.text.strip()
-        except Exception as e:
-            # If Gemini hits rate limit/quota or takes too long, fall back instantly
-            pass
+        if gemini_client:
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.7,
+                )
+                resp = gemini_client.models.generate_content(
+                    model='gemini-3.5-flash-lite',
+                    contents=user_message,
+                    config=config
+                )
+                if resp and resp.text:
+                    bot_response = resp.text.strip()
+            except Exception as e:
+                print(f"[Gemini API Error] {type(e).__name__}: {e}", flush=True)
         
         # If Gemini is unavailable or rate-limited, provide instant eco response
         if not bot_response:
@@ -139,17 +158,43 @@ def chat():
             'bot_response': get_eco_fallback_response(user_message if 'user_message' in locals() else '')
         })
 
+# Sources: Diet values are UK estimates (Scarborough et al. 2014, doi 10.1007/s10584-014-1169-1, via Ethical Consumer); LPG is the DEFRA factor.
+DIET_FACTORS = {
+    'vegan': 19.2,
+    'vegetarian': 26.7,
+    'fish': 27.5,
+    'low_meat': 32.7,
+    'medium_meat': 38.5,
+    'high_meat': 50.0
+}
+LPG_FACTOR = 2.94
+
 @app.route('/api/calculate', methods=['POST'])
 def calculate():
-    data = request.json
+    data = request.json or {}
     email = data.get('email')
     
-    travel_impact = data.get('travel', 0) * 0.12
-    shopping_impact = data.get('shopping', 0) * 5.0
-    electricity_impact = data.get('electricity', 0) * 0.85
-    waste_impact = data.get('waste', 0) * 0.5
+    travel_impact = float(data.get('travel', 0) or 0) * 0.12
+    shopping_impact = (float(data.get('shopping', 0) or 0) * 5.0) / 4.33
+    electricity_impact = (float(data.get('electricity', 0) or 0) * 0.85) / 4.33
+    waste_impact = float(data.get('waste', 0) or 0) * 0.5
     
-    total = travel_impact + shopping_impact + electricity_impact + waste_impact
+    food_val = data.get('food')
+    food_impact = DIET_FACTORS.get(food_val, 0.0)
+    
+    cooking_gas_val = max(0.0, float(data.get('cooking_gas', 0) or 0))
+    cooking_gas_impact = cooking_gas_val * LPG_FACTOR
+    
+    total = travel_impact + shopping_impact + electricity_impact + waste_impact + food_impact + cooking_gas_impact
+    
+    breakdown = {
+        'travel': round(travel_impact, 2),
+        'shopping': round(shopping_impact, 2),
+        'electricity': round(electricity_impact, 2),
+        'waste': round(waste_impact, 2),
+        'food': round(food_impact, 2),
+        'cooking_gas': round(cooking_gas_impact, 2)
+    }
     
     init_db()
     new_data = {
@@ -159,11 +204,27 @@ def calculate():
         'shopping': data.get('shopping', 0),
         'electricity': data.get('electricity', 0),
         'waste': data.get('waste', 0),
+        'food': data.get('food') or 0,
+        'cooking_gas': cooking_gas_val,
         'total_footprint': total
     }
     
     footprints_df = pd.read_excel(DB_FILE, sheet_name='footprints')
+    
+    # Fill 0 only in the new food and cooking_gas columns
+    if 'food' not in footprints_df.columns:
+        footprints_df['food'] = 0
+    else:
+        footprints_df['food'] = footprints_df['food'].fillna(0)
+        
+    if 'cooking_gas' not in footprints_df.columns:
+        footprints_df['cooking_gas'] = 0
+    else:
+        footprints_df['cooking_gas'] = footprints_df['cooking_gas'].fillna(0)
+        
     footprints_df = pd.concat([footprints_df, pd.DataFrame([new_data])], ignore_index=True)
+    footprints_df['food'] = footprints_df['food'].fillna(0)
+    footprints_df['cooking_gas'] = footprints_df['cooking_gas'].fillna(0)
     
     with pd.ExcelWriter(DB_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
         footprints_df.to_excel(writer, sheet_name='footprints', index=False)
@@ -189,6 +250,7 @@ def calculate():
     return jsonify({
         "success": True, 
         "total_footprint": total,
+        "breakdown": breakdown,
         "xp_gained": xp_gained,
         "new_xp": int(new_xp),
         "new_level": int(new_level)
@@ -196,14 +258,145 @@ def calculate():
 
 @app.route('/api/tips', methods=['POST'])
 def get_tips():
-    data = request.json
-    tips = []
-    if data.get('travel', 0) > 100: tips.append("Your travel footprint is high. Consider carpooling.")
-    if data.get('electricity', 0) > 300: tips.append("Reduce electricity usage by switching to LED bulbs.")
-    if data.get('shopping', 0) > 20: tips.append("Fast fashion contributes heavily to emissions. Try second-hand.")
-    if data.get('waste', 0) > 15: tips.append("Start a compost bin to reduce landfill contribution.")
-    if not tips: tips.append("Great job! Your footprint is low.")
-    return jsonify({"tips": tips})
+    data = request.json or {}
+    
+    travel_val = float(data.get('travel', 0) or 0)
+    shopping_val = float(data.get('shopping', 0) or 0)
+    electricity_val = float(data.get('electricity', 0) or 0)
+    waste_val = float(data.get('waste', 0) or 0)
+    food_val = data.get('food')
+    cooking_gas_val = max(0.0, float(data.get('cooking_gas', 0) or 0))
+    
+    travel_impact = travel_val * 0.12
+    shopping_impact = (shopping_val * 5.0) / 4.33
+    electricity_impact = (electricity_val * 0.85) / 4.33
+    waste_impact = waste_val * 0.5
+    food_impact = DIET_FACTORS.get(food_val, 0.0)
+    cooking_gas_impact = cooking_gas_val * LPG_FACTOR
+    
+    total = travel_impact + shopping_impact + electricity_impact + waste_impact + food_impact + cooking_gas_impact
+    
+    categories = []
+    
+    if travel_impact > 0:
+        categories.append({
+            'category': 'travel',
+            'user_value': travel_val,
+            'user_unit_key': 'travel_unit',
+            'impact': round(travel_impact, 2),
+            'action1_key': 'tip_travel_action1',
+            'action1_saving': round(travel_impact * 0.10, 2),
+            'action1_assumption_key': 'assumption_travel_10pct',
+            'action2_key': 'tip_travel_action2',
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    if shopping_impact > 0:
+        categories.append({
+            'category': 'shopping',
+            'user_value': shopping_val,
+            'user_unit_key': 'shopping_unit',
+            'impact': round(shopping_impact, 2),
+            'action1_key': 'tip_shopping_action1',
+            'action1_saving': round(5.0 / 4.33, 2) if shopping_val >= 1 else None,
+            'action1_assumption_key': 'assumption_shopping_1fewer' if shopping_val >= 1 else None,
+            'action2_key': 'tip_shopping_action2',
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    if electricity_impact > 0:
+        categories.append({
+            'category': 'electricity',
+            'user_value': electricity_val,
+            'user_unit_key': 'electricity_unit',
+            'impact': round(electricity_impact, 2),
+            'action1_key': 'tip_electricity_action1',
+            'action1_saving': round(electricity_impact * 0.10, 2),
+            'action1_assumption_key': 'assumption_electricity_10pct',
+            'action2_key': 'tip_electricity_action2',
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    if waste_impact > 0:
+        categories.append({
+            'category': 'waste',
+            'user_value': waste_val,
+            'user_unit_key': 'waste_unit',
+            'impact': round(waste_impact, 2),
+            'action1_key': 'tip_waste_action1',
+            'action1_saving': round(waste_impact * 0.20, 2),
+            'action1_assumption_key': 'assumption_waste_20pct',
+            'action2_key': 'tip_waste_action2',
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    if cooking_gas_impact > 0:
+        categories.append({
+            'category': 'cooking_gas',
+            'user_value': cooking_gas_val,
+            'user_unit_key': 'cooking_gas_unit',
+            'impact': round(cooking_gas_impact, 2),
+            'action1_key': 'tip_cooking_gas_action1',
+            'action1_saving': round(cooking_gas_impact * 0.10, 2),
+            'action1_assumption_key': 'assumption_cooking_gas_10pct',
+            'action2_key': 'tip_cooking_gas_action2',
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    if food_impact > 0 and food_val:
+        food_action1_key = f"tip_food_{food_val}_action1"
+        food_action2_key = f"tip_food_{food_val}_action2"
+        food_saving = None
+        food_assumption_key = None
+        
+        if food_val == 'high_meat':
+            food_saving = 11.5
+            food_assumption_key = 'assumption_food_high_to_medium'
+        elif food_val == 'medium_meat':
+            food_saving = 5.8
+            food_assumption_key = 'assumption_food_medium_to_low'
+        elif food_val == 'low_meat':
+            food_saving = 6.0
+            food_assumption_key = 'assumption_food_low_to_veg'
+        elif food_val == 'fish':
+            food_saving = 0.8
+            food_assumption_key = 'assumption_food_fish_to_veg'
+        elif food_val == 'vegetarian':
+            food_saving = 7.5
+            food_assumption_key = 'assumption_food_veg_to_vegan'
+            
+        categories.append({
+            'category': 'food',
+            'user_value': food_val,
+            'user_unit_key': 'diet_type',
+            'impact': round(food_impact, 2),
+            'action1_key': food_action1_key,
+            'action1_saving': food_saving,
+            'action1_assumption_key': food_assumption_key,
+            'action2_key': food_action2_key,
+            'action2_saving': None,
+            'action2_assumption_key': None
+        })
+        
+    # Sort categories by kg CO2e descending and take top 3
+    categories.sort(key=lambda x: x['impact'], reverse=True)
+    top_3 = categories[:3]
+    
+    # Encouragement message key if footprint is low or all numeric inputs are zero
+    encouragement_key = None
+    all_numeric_zero = (travel_val == 0 and shopping_val == 0 and electricity_val == 0 and waste_val == 0 and cooking_gas_val == 0)
+    if total < 50 or all_numeric_zero:
+        encouragement_key = 'tip_low_footprint_encouragement'
+        
+    return jsonify({
+        "tips": top_3,
+        "encouragement_key": encouragement_key
+    })
 
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
