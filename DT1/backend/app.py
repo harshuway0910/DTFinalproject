@@ -9,12 +9,13 @@ import google.generativeai as genai  # ← ADD THIS
 app = Flask(__name__)
 CORS(app)
 
-# ← ADD THESE 3 LINES (right after CORS(app))
+# Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-3.8-flash')
 
-DB_FILE = 'database.xlsx'
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'database.xlsx')
 
 def init_db():
     if not os.path.exists(DB_FILE):
