@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+*/node_modules/
+**/node_modules/
+
+# Production builds
+dist/
+*/dist/
+**/dist/
+build/
+*/build/
+**/build/
+
+# Archives & binaries
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.env
+**/.env
+**/.env.*
+# Allow example environment files
+!.env.example
+!**/.env.example
+
+# Python
+__pycache__/
+*/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.xlsx.temp
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

@@ -1,0 +1,29 @@
+# Environment variables & Secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Dependencies
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.xlsx.temp
+
+# Editor / System files
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db
